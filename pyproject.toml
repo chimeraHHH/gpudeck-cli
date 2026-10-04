@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpudeck-cli"
+version = "0.1.0"
+description = "An AI-friendly CLI for the GPUDeck Hub reservation API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/chimeraHHH/gpudeck-cli"
+Issues = "https://github.com/chimeraHHH/gpudeck-cli/issues"
+
+[project.scripts]
+gpudeck = "gpudeck_cli.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gpudeck_cli*"]
