@@ -15,7 +15,7 @@ gpudeck --version
 
 ```bash
 gpudeck login --username YOUR_USERNAME
-# 在终端隐藏输入密码；之后的命令自动复用登录会话。
+# macOS：在终端隐藏输入一次密码，之后自动登录，包括会话过期后的重新登录。
 
 gpudeck reserve \
   --server WHUServer-H200 --gpus 0 \
@@ -26,6 +26,22 @@ gpudeck reserve \
 示例时间需替换成实际所需时段。未指定 `--start` 时使用平台当前时间；不含 UTC 偏移的时间默认按 `Asia/Shanghai` 解释，与运行机器的时区无关。可用 `--timezone` 更改，或直接传 `2026-10-05T09:00:00+08:00`。
 
 完全非交互使用：由运行环境注入 `GPUDECK_USERNAME`、`GPUDECK_PASSWORD`，然后直接运行 `gpudeck reserve ...`。没有会话或会话过期时自动登录。也支持 `gpudeck login --username USER --password-stdin`，从标准输入读取一行密码。密码没有命令行参数，不写入配置、Cookie 文件或输出；请不要把真实密码写进代码和命令历史。
+
+### 一次输入密码，以后自动登录（macOS）
+
+`gpudeck login` 默认把验证成功的密码保存到 macOS 系统钥匙串，并记住当前平台的用户名。之后运行 `gpudeck whoami`、`gpus` 或 `reserve` 时先复用 Cookie；Cookie 过期或丢失时自动从钥匙串读取密码重新登录，无需再次输入密码或设置环境变量。再次执行 `gpudeck login` 也可以使用保存的密码。
+
+```bash
+gpudeck login --username YOUR_USERNAME  # 首次输入密码
+gpudeck whoami                         # 以后可直接使用
+gpudeck login --force                   # 改密码后重新输入并更新钥匙串
+gpudeck login --no-remember --username YOUR_USERNAME  # 只保留 Cookie
+gpudeck logout                         # 注销并清除当前平台记住的密码
+```
+
+macOS 如果提示钥匙串访问权限，请允许 CLI 所用的 Python 访问该项；解锁后的同一运行环境可继续自动读取。不会自动尝试过期密码：平台拒绝保存的密码后，CLI 会暂停自动登录并提示 `login --force`，避免后续启动反复失败而锁定账号。
+
+`--remember` 可显式开启此功能。Linux / Windows 当前保留 Cookie 和环境变量登录方式，默认不记住密码；显式 `--remember` 会报告当前平台不支持，不会降级为明文密码文件。
 
 可以让 CLI 选择卡：
 
@@ -91,7 +107,7 @@ gpudeck schema --pretty
 
 ## 凭据和配置
 
-默认状态路径为 `~/.local/state/gpudeck/<平台地址哈希>/cookies.txt`，或使用 `XDG_STATE_HOME`。各平台地址的会话隔离，目录权限 `0700`，Cookie 文件权限 `0600`。Cookie 是会话凭据；密码不持久化，CSRF Token 不输出。远程 URL 必须使用 HTTPS，并拒绝自动重定向；HTTP 仅支持本机接口测试。
+默认状态路径为 `~/.local/state/gpudeck/<平台地址哈希>/cookies.txt`，或使用 `XDG_STATE_HOME`。各平台地址的会话隔离，目录权限 `0700`，Cookie 和 `profile.json` 权限 `0600`。`profile.json` 只有用户名和自动登录开关；macOS 密码存入系统钥匙串，服务名按平台完整地址隔离，不写入项目、日志或进程参数，CSRF Token 不输出。远程 URL 必须使用 HTTPS，并拒绝自动重定向；HTTP 仅支持本机接口测试。
 
 | 配置 | 环境变量 | 参数 |
 | --- | --- | --- |
@@ -102,7 +118,7 @@ gpudeck schema --pretty
 | 时间解析时区 | `GPUDECK_TIMEZONE` | `--timezone` |
 | 请求超时 | — | `--timeout`，默认 20 秒 |
 
-改密码后重新运行 `gpudeck login --username YOUR_USERNAME` 即可。退出登录只注销本 CLI 的会话。
+改密码后运行 `gpudeck login --force` 更新保存的密码。退出登录会注销本 CLI 的会话并清除当前平台记住的密码；其他浏览器的会话不受影响。
 
 ## 验证
 
@@ -110,7 +126,7 @@ gpudeck schema --pretty
 python3 -m unittest discover -s tests -v
 ```
 
-测试使用本机 HTTP 契约服务，不需要真实账号，涵盖 Cookie/CSRF、会话复用与过期、账号切换、预约/取消/结束、重复请求、冲突、提交后超时和验证失败、时区、并发和凭据输出隔离。真实平台测试记录见 [VALIDATION.md](VALIDATION.md)。
+测试使用本机 HTTP 契约服务和钥匙串替身，不需要真实账号，涵盖 Cookie/CSRF、会话复用与过期、记住密码后的自动登录、更新/清除保存的密码、账号及平台隔离、预约/取消/结束、重复请求、冲突、提交后超时和验证失败、时区、并发和凭据输出隔离。验证记录见 [VALIDATION.md](VALIDATION.md)。
 
 协议依据：部署页面公开的前端请求，以及上游 [GPUDeck Hub API](https://github.com/leeechsh/gpudeck/blob/main/crates/gpudeck-hub/src/api.rs) 和 [预约检查逻辑](https://github.com/leeechsh/gpudeck/blob/main/src/hub/reservationChecks.ts)。这是独立 CLI；平台未来更改接口或规则时需要同步调整。
 

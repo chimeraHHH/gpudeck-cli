@@ -22,6 +22,35 @@ USER_ID = str(uuid.uuid4())
 GPU_ID = str(uuid.uuid4())
 
 
+class FakeKeychain:
+    """Persistent across client instances, with no access to the user's Keychain."""
+    def __init__(self):
+        self.supported = False
+        self.values = {}
+        self.reads = 0
+        self.writes = 0
+        self.deletes = 0
+        self.failure = None
+
+    def get(self, service, username):
+        self.reads += 1
+        if self.failure:
+            raise self.failure
+        return self.values.get((service, username))
+
+    def set(self, service, username, password):
+        self.writes += 1
+        if self.failure:
+            raise self.failure
+        self.values[(service, username)] = password
+
+    def delete(self, service, username):
+        self.deletes += 1
+        if self.failure:
+            raise self.failure
+        self.values.pop((service, username), None)
+
+
 class ContractHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -64,7 +93,7 @@ class ContractHandler(BaseHTTPRequestHandler):
         path = self.path.removeprefix("/api/v1")
         if path == "/auth/login":
             self.server.logins += 1
-            if body["password"] != "test-pass":
+            if body["password"] != self.server.password:
                 return self.reply(401, {"error": "用户名或密码错误"})
             self.server.username = body["username"]
             return self.reply(200, {"csrfToken": "secret-csrf"},
@@ -106,6 +135,7 @@ class CliContractTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), ContractHandler)
         for key, value in {"session": str(uuid.uuid4()), "username": "test", "records": [],
+                           "password": "test-pass",
                            "logins": 0, "creates": 0, "actions": 0, "conflict": False,
                            "delay_create": 0, "fail_after_create": False,
                            "fail_verification": False, "error_after_create": False}.items():
@@ -116,12 +146,16 @@ class CliContractTests(unittest.TestCase):
         self.global_args = ["--url", self.url, "--state-dir", self.tmp.name]
         self.env = patch.dict("os.environ", {"GPUDECK_USERNAME": "test", "GPUDECK_PASSWORD": "test-pass"})
         self.env.start()
+        self.keychain = FakeKeychain()
+        self.keychain_patch = patch("gpudeck_cli.auth.Keychain", return_value=self.keychain)
+        self.keychain_patch.start()
         self.start = wire_time(datetime.now(UTC) + timedelta(hours=1))
         self.reserve_args = ["reserve", "--server", "H200", "--gpus", "0", "--start", self.start,
                              "--hours", "1", "--project", "CLI test", "--purpose", "debug"]
 
     def tearDown(self):
         self.env.stop()
+        self.keychain_patch.stop()
         self.server.shutdown()
         self.server.server_close()
         self.tmp.cleanup()
@@ -257,6 +291,138 @@ class CliContractTests(unittest.TestCase):
         self.assertFalse(cookie_path.exists())
         code, result = self.cli(["whoami"], GPUDECK_USERNAME="", GPUDECK_PASSWORD="")
         self.assertEqual(code, 3)
+
+    def test_enter_password_once_then_expired_session_auto_login(self):
+        self.keychain.supported = True
+        with patch.dict("os.environ", {}, clear=True), \
+                patch("sys.stdin.isatty", return_value=True), \
+                patch("gpudeck_cli.cli.getpass.getpass", return_value="test-pass") as prompt:
+            code, result = self.cli(["login", "--username", "test"])
+            self.assertEqual(code, 0)
+            self.assertTrue(result["data"]["autoLogin"])
+            self.assertEqual(result["data"]["credentialStore"], "macOS Keychain")
+            prompt.assert_called_once()
+        self.server.session = "expired-cookie"
+        with patch.dict("os.environ", {}, clear=True):
+            code, result = self.cli(["whoami"])
+        self.assertEqual(code, 0)
+        self.assertEqual(result["data"]["username"], "test")
+        self.assertEqual(self.server.logins, 2)
+        cookie = Path(next(Path(self.tmp.name).glob("*/cookies.txt")))
+        profile = cookie.with_name("profile.json")
+        self.assertEqual(json.loads(profile.read_text()), {"username": "test", "autoLogin": True})
+        self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
+        self.assertNotIn("test-pass", profile.read_text())
+        self.assertNotIn("test-pass", cookie.read_text())
+
+    def test_missing_cookie_auto_login_and_login_command_without_prompt(self):
+        self.keychain.supported = True
+        _, result = self.cli(["login"])
+        Path(result["data"]["sessionFile"]).unlink()
+        with patch.dict("os.environ", {}, clear=True), \
+                patch("gpudeck_cli.cli.getpass.getpass") as prompt:
+            code, result = self.cli(["whoami"])
+            self.assertEqual(code, 0)
+            code, result = self.cli(["login"])
+            self.assertEqual(code, 0)
+            self.assertTrue(result["data"]["autoLogin"])
+            prompt.assert_not_called()
+        self.assertEqual(self.server.logins, 3)
+
+    def test_valid_cookie_never_requires_keychain_access(self):
+        self.keychain.supported = True
+        self.cli(["login"])
+        self.keychain.failure = DeckError("credential_store_error", "钥匙串已锁定", 3)
+        with patch.dict("os.environ", {}, clear=True):
+            code, result = self.cli(["whoami"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.keychain.reads, 0)
+
+    def test_stale_saved_password_disables_repeated_login_and_force_updates(self):
+        self.keychain.supported = True
+        self.cli(["login"])
+        self.server.password = "new-pass"
+        self.server.session = "expired-cookie"
+        with patch.dict("os.environ", {}, clear=True):
+            code, result = self.cli(["whoami"])
+            self.assertEqual(code, 3)
+            self.assertEqual(result["error"]["code"], "saved_credentials_rejected")
+            attempts = self.server.logins
+            code, result = self.cli(["whoami"])
+            self.assertEqual(code, 3)
+            self.assertEqual(self.server.logins, attempts)
+            with patch("sys.stdin.isatty", return_value=True), \
+                    patch("gpudeck_cli.cli.getpass.getpass", return_value="new-pass") as prompt:
+                code, result = self.cli(["login", "--force"])
+                self.assertEqual(code, 0)
+                prompt.assert_called_once()
+            self.server.session = "expired-again"
+            code, result = self.cli(["whoami"])
+            self.assertEqual(code, 0)
+        self.assertIn("new-pass", self.keychain.values.values())
+
+    def test_no_remember_removes_existing_saved_password(self):
+        self.keychain.supported = True
+        self.cli(["login"])
+        code, result = self.cli(["login", "--no-remember"])
+        self.assertEqual(code, 0)
+        self.assertFalse(result["data"]["autoLogin"])
+        self.assertFalse(self.keychain.values)
+        self.assertFalse(Path(result["data"]["sessionFile"]).with_name("profile.json").exists())
+        self.server.session = "expired-cookie"
+        with patch.dict("os.environ", {}, clear=True):
+            code, result = self.cli(["whoami"])
+        self.assertEqual(code, 3)
+        self.assertEqual(self.server.logins, 2)
+
+    def test_logout_forgets_password_and_cannot_auto_relogin(self):
+        self.keychain.supported = True
+        self.cli(["login"])
+        code, result = self.cli(["logout"])
+        self.assertEqual(code, 0)
+        self.assertFalse(result["data"]["autoLogin"])
+        self.assertFalse(self.keychain.values)
+        with patch.dict("os.environ", {}, clear=True):
+            code, result = self.cli(["whoami"])
+        self.assertEqual(code, 3)
+        self.assertEqual(self.server.logins, 1)
+
+    def test_remember_unsupported_and_permission_failure_are_structured(self):
+        code, result = self.cli(["login", "--remember"])
+        self.assertEqual(code, 3)
+        self.assertEqual(self.server.logins, 0)
+        self.keychain.supported = True
+        self.keychain.failure = DeckError("credential_store_error", "不允许访问钥匙串", 3)
+        code, result = self.cli(["login"])
+        self.assertEqual(code, 3)
+        self.assertTrue(result["error"]["details"]["loggedIn"])
+        self.assertFalse(result["error"]["details"]["autoLogin"])
+
+    def test_saved_password_is_not_used_for_different_account(self):
+        self.keychain.supported = True
+        self.cli(["login"])
+        with patch.dict("os.environ", {}, clear=True):
+            code, result = self.cli(["whoami", "--username", "someone-else"])
+        self.assertEqual(code, 3)
+        self.assertEqual(result["error"]["code"], "account_mismatch")
+        self.assertEqual(self.server.logins, 1)
+        self.assertEqual(self.keychain.reads, 0)
+
+    def test_failed_login_never_saves_password(self):
+        self.keychain.supported = True
+        code, result = self.cli(["login"], GPUDECK_PASSWORD="wrong")
+        self.assertEqual(code, 3)
+        self.assertFalse(self.keychain.values)
+        self.assertEqual(self.keychain.writes, 0)
+        self.assertFalse(list(Path(self.tmp.name).glob("*/profile.json")))
+
+    def test_saved_credentials_are_scoped_to_origin(self):
+        self.keychain.supported = True
+        self.cli(["login"])
+        other = Client("http://127.0.0.1:1", self.tmp.name)
+        self.assertNotEqual(other.credentials.service, "gpudeck-cli:" + self.url)
+        self.assertIsNone(other.credentials.get())
+        self.assertEqual(self.keychain.reads, 0)
 
 
 class TransportTests(unittest.TestCase):

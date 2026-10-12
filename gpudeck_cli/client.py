@@ -13,24 +13,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import __version__
+from .auth import CredentialStore
+from .errors import DeckError
+
 DEFAULT_URL = "https://gpudeck.cslee.cc"
-
-
-class DeckError(Exception):
-    def __init__(self, code, message, exit_code=1, *, status=None, details=None):
-        super().__init__(message)
-        self.code = code
-        self.exit_code = exit_code
-        self.status = status
-        self.details = details
-
-    def as_dict(self):
-        result = {"code": self.code, "message": str(self)}
-        if self.status is not None:
-            result["status"] = self.status
-        if self.details is not None:
-            result["details"] = self.details
-        return result
 
 
 def public_data(value):
@@ -81,6 +68,7 @@ class Client:
             Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "gpudeck"
         )).expanduser()
         self.state_dir = root / hashlib.sha256(self.url.encode()).hexdigest()[:16]
+        self.credentials = CredentialStore(self.url, self.state_dir)
         self.cookie_file = self.state_dir / "cookies.txt"
         self.jar = http.cookiejar.MozillaCookieJar(str(self.cookie_file))
         if self.cookie_file.exists():
@@ -116,7 +104,7 @@ class Client:
         self.cookie_file.unlink(missing_ok=True)
 
     def request(self, path, method="GET", body=None):
-        headers = {"Accept": "application/json", "User-Agent": "gpudeck-cli/0.1.0"}
+        headers = {"Accept": "application/json", "User-Agent": f"gpudeck-cli/{__version__}"}
         if body is not None:
             headers["Content-Type"] = "application/json"
         if self.csrf:
@@ -176,26 +164,43 @@ class Client:
         self.user = user
         return user
 
-    def login(self, username, password):
-        # An explicit login replaces the local jar; passwords are never saved.
+    def login(self, username, password, *, from_keychain=False):
+        # Saving a password is a separate, explicit CLI policy after login succeeds.
         self.jar.clear()
         self.csrf = ""
-        self.request("/auth/login", "POST", {"username": username, "password": password})
-        user = self.me()
+        try:
+            self.request("/auth/login", "POST", {"username": username, "password": password})
+            user = self.me()
+        except DeckError as exc:
+            if from_keychain and exc.status == 401:
+                # Do not repeatedly submit a stale password and lock the account.
+                self.credentials.disable()
+                raise DeckError("saved_credentials_rejected", "已保存的密码失效；请运行 gpudeck login --force 输入新密码", 3, status=401) from None
+            raise
         self.save()
         return user
 
     def authenticate(self, username=None, password=None):
+        mismatch = False
         if any(self.jar):
             try:
                 user = self.me()
                 if not username or user.get("username") == username:
                     return user
-                if password is None:
-                    raise DeckError("account_mismatch", "缓存会话属于其他账号；请为指定用户名提供密码重新登录", 3)
+                mismatch = True
             except DeckError as exc:
                 if exc.status != 401:
                     raise
+        from_keychain = False
+        if password is None:
+            saved = self.credentials.get(username)
+            if saved:
+                username, password = saved
+                from_keychain = True
+        elif not username:
+            username = self.credentials.username
         if not username or password is None:
-            raise DeckError("authentication_required", "请先运行 gpudeck login，或设置 GPUDECK_USERNAME 和 GPUDECK_PASSWORD", 3)
-        return self.login(username, password)
+            if mismatch:
+                raise DeckError("account_mismatch", "缓存会话属于其他账号；请为指定用户名提供密码重新登录", 3)
+            raise DeckError("authentication_required", "请先运行 gpudeck login 记住密码，或设置 GPUDECK_USERNAME 和 GPUDECK_PASSWORD", 3)
+        return self.login(username, password, from_keychain=from_keychain)

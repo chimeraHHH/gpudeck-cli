@@ -8,6 +8,8 @@ dist/
 .env.*
 cookies.txt
 session.json
+profile.json
+.profile-*
 .cookies-*
 validation-live*.json
 *.local.md

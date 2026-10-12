@@ -39,8 +39,8 @@ def parser():
     sub = root.add_subparsers(dest="command", required=True, parser_class=Parser)
     commands = {}
     for name, help_text in [
-        ("login", "登录并保存 Cookie 会话，不保存密码"),
-        ("logout", "注销当前 CLI 会话"),
+        ("login", "登录；macOS 默认将密码保存到系统钥匙串供以后自动登录"),
+        ("logout", "注销会话并清除当前平台记住的密码"),
         ("whoami", "查询登录身份"),
         ("resources", "查询平台原始资源信息"),
         ("gpus", "查询 GPU 和实际占用"),
@@ -81,6 +81,12 @@ def parser():
     for name in ["cancel", "end"]:
         commands[name].add_argument("reservation_id", help="预约 ID")
         commands[name].add_argument("--dry-run", action="store_true", help="预览操作，不提交")
+    remember = commands["login"].add_mutually_exclusive_group()
+    remember.add_argument("--remember", dest="remember", action="store_true", default=None,
+                          help="将密码保存到 macOS 系统钥匙串（macOS 默认开启）")
+    remember.add_argument("--no-remember", dest="remember", action="store_false",
+                          help="只保存 Cookie，不记住密码")
+    commands["login"].add_argument("--force", action="store_true", help="输入新密码，更新保存的凭据")
     return root
 
 
@@ -90,7 +96,10 @@ def schema():
         "authentication": {
             "login": "gpudeck login --username USER（终端隐藏输入密码）",
             "noninteractive": ["GPUDECK_USERNAME", "GPUDECK_PASSWORD"],
-            "passwordStdin": "--password-stdin", "cachedCookie": True, "storesPassword": False,
+            "passwordStdin": "--password-stdin", "cachedCookie": True,
+            "storesPassword": True, "passwordStorage": "macOS Keychain",
+            "rememberDefault": "macOS", "plaintextPasswordFile": False,
+            "autoLoginAfterSessionExpiry": True, "changedPassword": "gpudeck login --force",
         },
         "commands": {
             "whoami": "当前身份；不输出 CSRF Token",
@@ -101,7 +110,8 @@ def schema():
             "availability": "--start TIME (--end TIME | --hours N) [--server NAME] [--model H200]",
             "reserve": "(--server NAME --gpus 0,1 | --gpu-id ID ... | --auto [--count N]) --start TIME (--end TIME | --hours N) --project NAME --purpose TEXT [--dry-run]",
             "cancel": "RESERVATION_ID [--dry-run]", "end": "RESERVATION_ID [--dry-run]",
-            "login": "[--username USER] [--password-stdin]", "logout": "注销 CLI Cookie 会话",
+            "login": "[--username USER] [--password-stdin] [--remember | --no-remember] [--force]",
+            "logout": "注销 CLI Cookie 会话并清除记住的密码",
         },
         "output": {"success": {"ok": True, "data": {}},
                    "failure": {"ok": False, "error": {"code": "...", "message": "..."}}},
@@ -116,22 +126,48 @@ def schema():
     }
 
 
-def credentials(args, interactive=False):
+def credentials(args):
     username = getattr(args, "username", None) or os.environ.get("GPUDECK_USERNAME")
-    password = os.environ.get("GPUDECK_PASSWORD")
+    password = os.environ.get("GPUDECK_PASSWORD") or None
     if getattr(args, "password_stdin", False):
         line = sys.stdin.readline()
         if not line:
             raise DeckError("credentials_missing", "标准输入未提供密码", 3)
         password = line.rstrip("\r\n")
-    if interactive and sys.stdin.isatty():
+    return username, password
+
+
+def login(client, args):
+    store = client.credentials
+    remember = store.keychain.supported if args.remember is None else args.remember
+    if remember and not store.keychain.supported:
+        raise DeckError("credential_store_unavailable", "记住密码目前支持 macOS 系统钥匙串；可使用 --no-remember", 3)
+    username, password = credentials(args)
+    username = username or store.username
+    from_keychain = False
+    if password is None and remember and not args.force:
+        saved = store.get(username)
+        if saved:
+            username, password = saved
+            from_keychain = True
+    if sys.stdin.isatty():
         if not username:
             username = input("GPUDeck 用户名: ").strip()
         if password is None:
             password = getpass.getpass("GPUDeck 密码: ")
-    if interactive and (not username or password is None):
-        raise DeckError("credentials_missing", "非交互登录需要用户名及 GPUDECK_PASSWORD 或 --password-stdin", 3)
-    return username, password
+    if not username or password is None:
+        raise DeckError("credentials_missing", "请在终端输入密码，或使用 GPUDECK_PASSWORD / --password-stdin", 3)
+    user = client.login(username, password, from_keychain=from_keychain)
+    try:
+        if remember:
+            store.remember(user["username"], password)
+        else:
+            store.forget()
+    except DeckError as exc:
+        exc.details = {"loggedIn": True, "autoLogin": False, "sessionFile": str(client.cookie_file)}
+        raise
+    return {"user": user, "sessionFile": str(client.cookie_file), "autoLogin": store.enabled,
+            "credentialStore": "macOS Keychain" if store.enabled else None}
 
 
 def action(client, args, user):
@@ -213,8 +249,7 @@ def run(args):
     client = Client(getattr(args, "url", None) or os.environ.get("GPUDECK_URL", DEFAULT_URL),
                     getattr(args, "state_dir", None), getattr(args, "timeout", 20))
     if args.command == "login":
-        username, password = credentials(args, interactive=True)
-        return {"user": client.login(username, password), "sessionFile": str(client.cookie_file)}
+        return login(client, args)
     if args.command == "logout":
         if any(client.jar):
             try:
@@ -224,7 +259,8 @@ def run(args):
                 if exc.status != 401:
                     raise
         client.clear()
-        return {"loggedOut": True}
+        client.credentials.forget()
+        return {"loggedOut": True, "autoLogin": False}
     username, password = credentials(args)
     user = client.authenticate(username, password)
     if args.command == "whoami":
